@@ -1,6 +1,6 @@
 import { WebDriver } from 'selenium-webdriver';
-import { createDriver, navigateToAlfa, waitForQrAndCapture, collectOperations as collectAlfaOperations, closeDriver } from '../selenium.js';
-import type { OperationItem } from '../selenium.js';
+import { createDriver, navigateToAlfa, waitForQrAndCapture, collectOperations as collectAlfaOperations, closeDriver } from '../playwright.js';
+import type { OperationItem } from '../playwright.js';
 import type { BankCollector, BankCollectorContext, BankOperationItem } from './types.js';
 
 export class AlfaCollector implements BankCollector {

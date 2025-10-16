@@ -11,6 +11,18 @@ type DbOp = {
   bank_category: string;
   amount: number;
   bank: string;
+  message?: string | null;
+  op_time?: Date | null;
+  op_datetime_text?: string | null;
+  op_id?: string | null;
+  account_name?: string | null;
+  account_mask?: string | null;
+  counterparty?: string | null;
+  counterparty_phone?: string | null;
+  counterparty_bank?: string | null;
+  fee_amount?: number | null;
+  total_amount?: number | null;
+  channel?: string | null;
 };
 
 type PgPool = {
@@ -28,8 +40,8 @@ async function makePool(): Promise<PgPool> {
   return pool as PgPool;
 }
 
-async function getLatestKnown(POOL: PgPool, bank: string): Promise<{ raw_date: string; text: string; amount: number } | null> {
-  const sql = 'select raw_date, text, amount from finance.operations where bank = $1 order by id desc limit 1';
+async function getLatestKnown(POOL: PgPool, bank: string): Promise<{ raw_date: string; text: string; amount: number; op_id: string | null; op_datetime_text: string | null } | null> {
+  const sql = 'select raw_date, text, amount, op_id, op_datetime_text from finance.operations where bank = $1 order by id desc limit 1';
   const r = await POOL.query(sql, [bank]);
   if (r.rows.length === 0) return null;
   return r.rows[0];
@@ -59,14 +71,49 @@ function normalizeDate(raw: string): string {
 
 async function insertNew(POOL: PgPool, ops: DbOp[]): Promise<number> {
   if (ops.length === 0) return 0;
-  const sql = 'insert into finance.operations (raw_date, op_date, text, bank_category, amount, bank) values ' +
-    ops.map((_, i) => `($${i*6+1}, $${i*6+2}, $${i*6+3}, $${i*6+4}, $${i*6+5}, $${i*6+6})`).join(', ');
+  const cols = ['raw_date','op_date','text','bank_category','amount','bank','message','op_time','op_datetime_text','op_id','account_name','account_mask','counterparty','counterparty_phone','counterparty_bank','fee_amount','total_amount','channel'];
+  const valuesSql = ops.map((_, i) => '(' + cols.map((__, j) => `$${i*cols.length + j + 1}`).join(', ') + ')').join(', ');
+  const sql = `insert into finance.operations (${cols.join(', ')}) values ${valuesSql} on conflict (bank, op_id) where op_id is not null do nothing`;
   const params: any[] = [];
   for (const o of ops) {
-    params.push(o.raw_date, o.op_date, o.text, o.bank_category, o.amount, o.bank);
+    params.push(
+      o.raw_date,
+      o.op_date,
+      o.text,
+      o.bank_category,
+      o.amount,
+      o.bank,
+      o.message ?? null,
+      o.op_time ?? null,
+      o.op_datetime_text ?? null,
+      o.op_id ?? null,
+      o.account_name ?? null,
+      o.account_mask ?? null,
+      o.counterparty ?? null,
+      o.counterparty_phone ?? null,
+      o.counterparty_bank ?? null,
+      o.fee_amount ?? null,
+      o.total_amount ?? null,
+      o.channel ?? null,
+    );
   }
   const r = await POOL.query(sql, params);
   return r.rowCount || ops.length;
+}
+
+function parseRuDateTime(text: string): Date | null {
+  const s = (text || '').trim().toLowerCase();
+  const m = s.match(/(\d{1,2})\s+([а-я]+)\s+(\d{4}).*?(\d{1,2}):(\d{2})/);
+  const months = ['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
+  if (!m) return null;
+  const day = Number(m[1] ?? '');
+  const monStr = m[2] ?? '';
+  const year = Number(m[3] ?? '');
+  const hh = Number(m[4] ?? '');
+  const mm = Number(m[5] ?? '');
+  const mi = months.indexOf(monStr);
+  if (!Number.isFinite(day) || !Number.isFinite(year) || mi < 0 || !Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  return new Date(year, mi, day, hh, mm);
 }
 
 async function main(): Promise<void> {
@@ -84,8 +131,9 @@ async function main(): Promise<void> {
       console.log(`[vtb] onSnapshot ${items.length} operations`);
       collected.push(...items);
       if (latest) {
-        const found = items.some(it => it.date === latest!.raw_date && it.text === latest!.text && it.amount === Number(latest!.amount));
-        if (found) throw new Error(sentinel);
+        const foundById = latest.op_id && items.some(it => (it.opId || '') === latest!.op_id);
+        const foundByLegacy = items.some(it => it.date === latest!.raw_date && it.text === latest!.text && it.amount === Number(latest!.amount) && (it.opDateTimeText || '') === (latest!.op_datetime_text || ''));
+        if (foundById || foundByLegacy) throw new Error(sentinel);
       }
     };
     try {
@@ -105,7 +153,7 @@ async function main(): Promise<void> {
 
     const newOnly: DbOp[] = [];
     for (const it of newestFirst) {
-      const isOld = latest && it.date === latest.raw_date && it.text === latest.text && it.amount === Number(latest.amount);
+      const isOld = latest && ((latest.op_id && (it.opId || '') === latest.op_id) || (it.date === latest.raw_date && it.text === latest.text && it.amount === Number(latest.amount) && (it.opDateTimeText || '') === (latest.op_datetime_text || '')));
       if (isOld) break;
       newOnly.push({
         raw_date: it.date,
@@ -113,7 +161,19 @@ async function main(): Promise<void> {
         text: it.text,
         bank_category: it.category,
         amount: it.amount,
-        bank: 'vtb'
+        bank: 'vtb',
+        message: it.message || null,
+        op_time: parseRuDateTime(it.opDateTimeText || '') || null,
+        op_datetime_text: it.opDateTimeText || null,
+        op_id: it.opId || null,
+        account_name: it.accountName || null,
+        account_mask: it.accountMask || null,
+        counterparty: it.counterparty || null,
+        counterparty_phone: it.counterpartyPhone || null,
+        counterparty_bank: it.counterpartyBank || null,
+        fee_amount: typeof it.feeAmount === 'number' ? it.feeAmount : null,
+        total_amount: typeof it.totalAmount === 'number' ? it.totalAmount : null,
+        channel: it.channel || null,
       });
     }
     if (newOnly.length > 0) {
