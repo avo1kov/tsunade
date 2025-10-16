@@ -8,8 +8,8 @@ export type TelegramEnv = {
 };
 
 export function getTelegramEnv(): TelegramEnv {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN || '';
-  const chatId = process.env.TELEGRAM_CHAT_ID || '';
+  const botToken = (process.env.TSUNADE__TELEGRAM_BOT_TOKEN || '').trim();
+  const chatId = (process.env.TSUNADE__TELEGRAM_CHAT_ID || '').trim();
   if (!botToken) {
     throw new Error('Missing TELEGRAM_BOT_TOKEN');
   }
@@ -47,5 +47,3 @@ export async function sendDocument(filePath: string, caption?: string): Promise<
   const filename = path.basename(filePath);
   await bot.telegram.sendDocument(chatId, { source: buffer, filename }, options);
 }
-
-

@@ -7,6 +7,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
+    "mcp": "node dist/mcp-server.js",
+    "mcp:http": "tsx src/mcp-http.ts",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
@@ -27,10 +29,14 @@
     "typescript": "^5.9.2"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.2",
     "chromedriver": "^140.0.2",
     "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "pg": "^8.16.3",
     "qrcode-terminal": "^0.12.0",
     "selenium-webdriver": "^4.35.0",
-    "telegraf": "^4.16.3"
+    "telegraf": "^4.16.3",
+    "zod": "^3.25.76"
   }
 }
