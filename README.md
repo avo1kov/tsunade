@@ -10,5 +10,3 @@ Tsunade is a steady advisor for money. It gathers financial operations from diff
 - **steadies**: performs an everyday audit of your current financial behavior to keep you on course
 - **plans**: takes into account future finance plans (like array of preprompts) to contextualize today's decisions
 - **marks**: highlights non-typical operations and strange transfers for quick review and markdown
-
-Tsunade transforms scattered activity into a clear signal—reducing noise, revealing trends, and helping you move with quiet confidence.
