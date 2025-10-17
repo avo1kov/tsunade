@@ -23,6 +23,7 @@ type DbOp = {
   fee_amount?: number | null;
   total_amount?: number | null;
   channel?: string | null;
+  op_datetime?: Date | null;
 };
 
 type PgPool = {
@@ -71,7 +72,7 @@ function normalizeDate(raw: string): string {
 
 async function insertNew(POOL: PgPool, ops: DbOp[]): Promise<number> {
   if (ops.length === 0) return 0;
-  const cols = ['raw_date','op_date','text','bank_category','amount','bank','message','op_time','op_datetime_text','op_id','account_name','account_mask','counterparty','counterparty_phone','counterparty_bank','fee_amount','total_amount','channel'];
+  const cols = ['raw_date','op_date','text','bank_category','amount','bank','message','op_time','op_datetime_text','op_id','account_name','account_mask','counterparty','counterparty_phone','counterparty_bank','fee_amount','total_amount','channel','op_datetime'];
   const valuesSql = ops.map((_, i) => '(' + cols.map((__, j) => `$${i*cols.length + j + 1}`).join(', ') + ')').join(', ');
   const sql = `insert into finance.operations (${cols.join(', ')}) values ${valuesSql} on conflict (bank, op_id) where op_id is not null do nothing`;
   const params: any[] = [];
@@ -95,6 +96,7 @@ async function insertNew(POOL: PgPool, ops: DbOp[]): Promise<number> {
       o.fee_amount ?? null,
       o.total_amount ?? null,
       o.channel ?? null,
+      o.op_datetime ?? null,
     );
   }
   const r = await POOL.query(sql, params);
@@ -174,6 +176,7 @@ async function main(): Promise<void> {
         fee_amount: typeof it.feeAmount === 'number' ? it.feeAmount : null,
         total_amount: typeof it.totalAmount === 'number' ? it.totalAmount : null,
         channel: it.channel || null,
+        op_datetime: parseRuDateTime(it.opDateTimeText || '') || null,
       });
     }
     if (newOnly.length > 0) {
