@@ -215,43 +215,11 @@ async function clickAndParseItem(page: any, index: number): Promise<BankOperatio
       try { console.log('[vtb] clickAndParseItem:no_btn', { index }); } catch {}
       return null;
     }
-    await humanPause(page, 150, 250);
-    try {
-      await page.evaluate(async (sel: string, idx: number) => {
-        const list = Array.from(document.querySelectorAll(sel)) as HTMLElement[];
-        const el = list[idx];
-        if (!el) return;
-        let node: any = el as any;
-        let best: any = (document.scrollingElement || document.documentElement) as any;
-        while (node) {
-          const st = typeof node.scrollTop === 'number' ? node.scrollTop : null;
-          const sh = typeof node.scrollHeight === 'number' ? node.scrollHeight : null;
-          const ch = typeof node.clientHeight === 'number' ? node.clientHeight : null;
-          if (st !== null && sh !== null && ch !== null && sh > ch + 10) { best = node; }
-          node = (node.parentElement as any);
-        }
-        const rect = el.getBoundingClientRect();
-        const bestRect = (best.getBoundingClientRect ? best.getBoundingClientRect() : ({ height: window.innerHeight } as any));
-        const vh = (bestRect.height || window.innerHeight);
-        const targetTop = Math.max(0, (best.scrollTop || 0) + rect.top - Math.floor(vh * 0.33));
-        const startTop = best.scrollTop || 0;
-        const dist = targetTop - startTop;
-        const duration = 450;
-        const start = performance.now();
-        await new Promise<void>((resolve) => {
-          const step = (now: number) => {
-            const t = Math.min(1, (now - start) / duration);
-            const eased = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-            best.scrollTop = startTop + dist * eased;
-            if (t < 1) requestAnimationFrame(step); else resolve();
-          };
-          requestAnimationFrame(step);
-        });
-      }, SEL.listItem, index);
-    } catch {}
     await humanPause(page, 120, 200);
     const loc = page.locator(SEL.listItem).nth(index);
+    try { await page.click('main', { position: { x: 10, y: 10 }, timeout: 300 }); } catch {}
     await loc.scrollIntoViewIfNeeded();
+    await loc.evaluate((el: Element) => (el as HTMLElement).scrollIntoView({ block: 'center', inline: 'nearest' }));
     try { console.log('[vtb] clickAndParseItem:scrolled', { index }); } catch {}
     await humanPause(page, 150, 350);
     await loc.click();
