@@ -36,6 +36,8 @@ export class VtbCollector implements BankCollector {
   }
 
   async loginAndPrepare(): Promise<void> {
+    try { await fetch(VTB_DELETE_CODE_URL, { method: 'DELETE' }); } catch {}
+
     if (!this.driver) throw new Error('driver not initialized');
     console.log('[vtb] goto', VTB_HISTORY_URL);
     await this.driver.page.goto(VTB_HISTORY_URL);
