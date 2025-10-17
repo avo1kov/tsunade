@@ -6,7 +6,6 @@ export type BankOperationItem = {
   message?: string;
   opTime?: string;
   opDateTimeText?: string;
-  opId?: string;
   accountName?: string;
   accountMask?: string;
   counterparty?: string;
@@ -15,6 +14,8 @@ export type BankOperationItem = {
   feeAmount?: number;
   totalAmount?: number;
   channel?: string;
+  opDateTime: string;
+  details?: Record<string, string>;
 };
 
 export interface BankCollectorContext {

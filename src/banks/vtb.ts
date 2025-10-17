@@ -14,6 +14,11 @@ const SEL = {
   detailsHeader: 'main h1'
 } as const;
 
+async function humanPause(page: any, base: number = 200, jitter: number = 300): Promise<void> {
+  const ms = base + Math.floor(Math.random() * jitter);
+  await page.waitForTimeout(ms);
+}
+
 async function waitForCodeFromUrl(url: string, timeoutMs: number = 180000, pattern: RegExp = /\b\d{4,8}\b/): Promise<string> {
   const started = Date.now();
   for (;;) {
@@ -71,6 +76,7 @@ export class VtbCollector implements BankCollector {
       } catch {}
 
       if (Date.now() - started > 300000) break;
+      try { console.log('[vtb] loginAndPrepare:loop', { didPhone, didOtp, didPin }); } catch {}
       await this.driver.page.waitForTimeout(500);
     }
   }
@@ -100,13 +106,20 @@ async function collectOperationsVtb(page: any, maxPages: number, onSnapshot?: (i
     if (await hasFatalError(page)) await new Promise(() => {});
 
     await page.waitForSelector('main');
+    try { console.log('[vtb] list main ready'); } catch {}
 
     const itemsCount: number = await getListCount(page);
 
     try { console.log('[vtb] itemsCount', itemsCount, 'seen', seen); } catch {}
+    if (itemsCount === 0) {
+      try { console.log('[vtb] list empty, trying slow scroll warmup'); } catch {}
+      for (let k = 0; k < 3; k++) { await scrollToLoadMore(page); }
+    }
 
     for (let i = seen; i < itemsCount; i++) {
+      try { console.log('[vtb] process index start', i); } catch {}
       const item = await clickAndParseItem(page, i);
+      try { console.log('[vtb] process index done', { i, ok: !!item }); } catch {}
 
       if (item) collected.push(item);
       if (onSnapshot && collected.length % 10 === 0) await onSnapshot(collected.slice(-10));
@@ -114,17 +127,17 @@ async function collectOperationsVtb(page: any, maxPages: number, onSnapshot?: (i
 
     seen = itemsCount;
 
-    const before: number = await getListCount(page);
-
-    try { console.log('[vtb] scroll load more, before', before); } catch {}
-
-    await scrollToLoadMore(page);
-
-    const after: number = await getListCount(page);
-
-    try { console.log('[vtb] after', after); } catch {}
-
-    if (after <= before) break;
+    let grew = false;
+    for (let tries = 0; tries < 8; tries++) {
+      const before: number = await getListCount(page);
+      try { console.log('[vtb] scroll load more, before', before, 'try', tries); } catch {}
+      await scrollToLoadMore(page);
+      const after: number = await getListCount(page);
+      try { console.log('[vtb] after', after, 'try', tries); } catch {}
+      if (after > before) { grew = true; break; }
+      await page.waitForTimeout(1200);
+    }
+    if (!grew) break;
   }
   if (onSnapshot && collected.length) await onSnapshot(collected.slice(-Math.min(collected.length, 10)));
   return collected;
@@ -149,22 +162,24 @@ async function getListCount(page: any): Promise<number> {
 }
 
 async function scrollToLoadMore(page: any): Promise<void> {
-  await page.evaluate(() => { const s = document.scrollingElement || document.documentElement; s.scrollTop = s.scrollHeight; });
-  await page.waitForTimeout(800);
+  try { await page.click('main', { position: { x: 10, y: 10 }, timeout: 300 }); } catch {}
+  await humanPause(page, 150, 300);
+  for (let k = 0; k < 3; k++) {
+    await humanPause(page, 120, 280);
+    try { await page.keyboard.press('End'); } catch {}
+    await page.waitForTimeout(10000);
+  }
 }
 
 async function fillPhoneAndContinue(page: any, phone: string): Promise<boolean> {
   const input = await page.waitForSelector(SEL.phoneInput, { timeout: 1000 }).catch(() => null);
   if (!input) return false;
+  await humanPause(page, 150, 300);
   try { await input.fill(''); } catch {}
-  await input.type(phone);
-  try {
-    const buttons = await page.$$('button, [role="button"]');
-    for (const btn of buttons) {
-      const txt = await page.evaluate((el: Element) => (el as HTMLElement).innerText || '', btn);
-      if (txt && txt.trim().toLowerCase().includes('продолжить')) { await btn.click(); break; }
-    }
-  } catch {}
+  await humanPause(page, 120, 240);
+  await input.type(phone, { delay: 60 + Math.floor(Math.random() * 70) });
+  await humanPause(page, 150, 250);
+  try { await page.keyboard.press('Enter'); } catch {}
   return true;
 }
 
@@ -172,8 +187,10 @@ async function enterOtpIfPresent(page: any): Promise<boolean> {
   const otp = await page.waitForSelector(SEL.otpInput, { timeout: 1000 }).catch(() => null);
   if (!otp) return false;
   const code = await waitForCodeFromUrl(VTB_GET_CODE_URL, 180000, /^\d{4,8}$/);
+  await humanPause(page, 150, 300);
   try { await otp.fill(''); } catch {}
-  await otp.type(code);
+  await humanPause(page, 120, 240);
+  await otp.type(code, { delay: 70 + Math.floor(Math.random() * 60) });
   try { await fetch(VTB_DELETE_CODE_URL, { method: 'DELETE' }); } catch {}
   return true;
 }
@@ -182,63 +199,142 @@ async function enterPinIfPresent(page: any): Promise<boolean> {
   const pinHandle = await page.waitForSelector(SEL.passcodeInput, { timeout: 1000 }).catch(() => null);
   if (!pinHandle) return false;
   const pin = (process.env.TSUNADE__VTB_PIN ?? '').trim();
+  await humanPause(page, 150, 300);
   try { await pinHandle.fill(''); } catch {}
-  if (pin) await pinHandle.type(pin);
+  await humanPause(page, 120, 240);
+  if (pin) await pinHandle.type(pin, { delay: 70 + Math.floor(Math.random() * 60) });
   return true;
 }
 
 async function clickAndParseItem(page: any, index: number): Promise<BankOperationItem | null> {
   try {
+    try { console.log('[vtb] clickAndParseItem:start', { index }); } catch {}
     const items = await page.$$(SEL.listItem);
-    const btn = items[index];
-    if (!btn) return null;
-    await btn.scrollIntoViewIfNeeded();
-    await btn.click();
-  } catch { return null; }
+    try { console.log('[vtb] clickAndParseItem:items_len', { index, len: items?.length ?? 0 }); } catch {}
+    if (!items[index]) {
+      try { console.log('[vtb] clickAndParseItem:no_btn', { index }); } catch {}
+      return null;
+    }
+    await humanPause(page, 150, 250);
+    try {
+      await page.evaluate(async (sel: string, idx: number) => {
+        const list = Array.from(document.querySelectorAll(sel)) as HTMLElement[];
+        const el = list[idx];
+        if (!el) return;
+        let node: any = el as any;
+        let best: any = (document.scrollingElement || document.documentElement) as any;
+        while (node) {
+          const st = typeof node.scrollTop === 'number' ? node.scrollTop : null;
+          const sh = typeof node.scrollHeight === 'number' ? node.scrollHeight : null;
+          const ch = typeof node.clientHeight === 'number' ? node.clientHeight : null;
+          if (st !== null && sh !== null && ch !== null && sh > ch + 10) { best = node; }
+          node = (node.parentElement as any);
+        }
+        const rect = el.getBoundingClientRect();
+        const bestRect = (best.getBoundingClientRect ? best.getBoundingClientRect() : ({ height: window.innerHeight } as any));
+        const vh = (bestRect.height || window.innerHeight);
+        const targetTop = Math.max(0, (best.scrollTop || 0) + rect.top - Math.floor(vh * 0.33));
+        const startTop = best.scrollTop || 0;
+        const dist = targetTop - startTop;
+        const duration = 450;
+        const start = performance.now();
+        await new Promise<void>((resolve) => {
+          const step = (now: number) => {
+            const t = Math.min(1, (now - start) / duration);
+            const eased = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+            best.scrollTop = startTop + dist * eased;
+            if (t < 1) requestAnimationFrame(step); else resolve();
+          };
+          requestAnimationFrame(step);
+        });
+      }, SEL.listItem, index);
+    } catch {}
+    await humanPause(page, 120, 200);
+    const loc = page.locator(SEL.listItem).nth(index);
+    await loc.scrollIntoViewIfNeeded();
+    try { console.log('[vtb] clickAndParseItem:scrolled', { index }); } catch {}
+    await humanPause(page, 150, 350);
+    await loc.click();
+    try { console.log('[vtb] clickAndParseItem:clicked', { index }); } catch {}
+  } catch (e) { try { console.log('[vtb] clickAndParseItem:error_click', { index, e }); } catch {} return null; }
   try {
+    try { console.log('[vtb] clickAndParseItem:wait_details_header', { index }); } catch {}
     const ok = await page.evaluate((sel: string) => {
       const h = document.querySelector(sel);
       const t = h ? (h.textContent || '').trim() : '';
       return !!h && t.length > 0;
     }, SEL.detailsHeader);
-    if (!ok) return null;
-  } catch { return null; }
+    try { console.log('[vtb] clickAndParseItem:details_header_ok', { index, ok }); } catch {}
+    if (!ok) {
+      try { console.log('[vtb] clickAndParseItem:details_header_not_ready', { index }); } catch {}
+      return null;
+    }
+  } catch (e) { try { console.log('[vtb] clickAndParseItem:error_wait_details', { index, e }); } catch {} return null; }
   try {
-    const details = await page.evaluate(() => {
-      const textContent = (el: Element | null | undefined): string => (el && el.textContent ? el.textContent : '').trim();
-      const h1 = document.querySelector('main h1');
-      const title = textContent(h1);
-      const mainEl = document.querySelector('main') as HTMLElement | null;
-      const textAll = mainEl && mainEl.innerText ? mainEl.innerText : '';
-      const allP = Array.from(document.querySelectorAll('main p'));
-      let category = '';
-      let datetimeText = '';
-      let amountText = '';
-      for (const p of allP) {
-        const t = textContent(p);
-        if (!category && t && !t.includes('₽') && /[А-Яа-яA-Za-z]/.test(t) && !/\d{1,2}:\d{2}/.test(t)) category = t;
-        if (!datetimeText && /\d{1,2}\s+[А-Яа-я]+.*\d{1,2}:\d{2}/.test(t)) datetimeText = t;
-        if (!amountText && t.includes('₽')) amountText = t;
-      }
-      const getDetail = (label: string) => {
-        const pList = Array.from(document.querySelectorAll('main p'));
-        for (let i = 0; i < pList.length - 1; i++) {
-          const a = textContent(pList[i]).toLowerCase();
-          if (a === label) return textContent(pList[i + 1]);
+    try { console.log('[vtb] clickAndParseItem:extract_details', { index }); } catch {}
+    try { console.log('[vtb] extract:h1_wait', { index }); } catch {}
+    const h1Handle = await page.waitForSelector('main h1', { timeout: 1000 }).catch(() => null);
+    const title = h1Handle ? await page.evaluate((el: Element) => (el.textContent || '').trim(), h1Handle) : '';
+    try { console.log('[vtb] extract:title', { index, title }); } catch {}
+    const mainEl = await page.waitForSelector('main', { timeout: 1000 }).catch(() => null);
+    const textAll = mainEl ? await page.evaluate((el: Element) => (el as any).innerText || '', mainEl) : '';
+    try { console.log('[vtb] extract:textAll_len', { index, len: textAll.length }); } catch {}
+    const pEls = await page.$$('main p');
+    try { console.log('[vtb] extract:p_count', { index, count: pEls.length }); } catch {}
+    const pTexts: string[] = [];
+    for (const p of pEls) {
+      const t = await page.evaluate((el: Element) => (el.textContent || '').trim(), p);
+      if (t) pTexts.push(t);
+    }
+    try { console.log('[vtb] extract:p_texts_len', { index, len: pTexts.length, sample: pTexts.slice(0, 3) }); } catch {}
+    let category = '';
+    let datetimeText = '';
+    let amountText = '';
+    for (const t of pTexts) {
+      if (!category && t && !t.includes('₽') && /[А-Яа-яA-Za-z]/.test(t) && !/\d{1,2}:\d{2}/.test(t)) category = t;
+      if (!datetimeText && /\d{1,2}\s+[А-Яа-я]+.*\d{1,2}:\d{2}/.test(t)) datetimeText = t;
+      if (!amountText && t.includes('₽')) amountText = t;
+    }
+    try { console.log('[vtb] extract:derived', { index, category, datetimeText, amountText }); } catch {}
+    const h2Els = await page.$$('main h2');
+    try { console.log('[vtb] extract:h2_count', { index, count: h2Els.length }); } catch {}
+    let detailsIndex = -1;
+    for (let i = 0; i < h2Els.length; i++) {
+      const t = await page.evaluate((el: Element) => (el.textContent || '').trim().toLowerCase(), h2Els[i]);
+      if (t === 'детали операции') { detailsIndex = i; break; }
+    }
+    try { console.log('[vtb] extract:details_index', { index, detailsIndex }); } catch {}
+    const detailsMap: Record<string, string> = {};
+    if (detailsIndex >= 0) {
+      const targetH2 = h2Els[detailsIndex];
+      const detailTexts: string[] = await page.evaluate((h: Element) => {
+        const out: string[] = [];
+        let el: Element | null = (h as Element).nextElementSibling as Element | null;
+        while (el && el.tagName !== 'H2') {
+          const ps = Array.from(el.querySelectorAll('p')) as Element[];
+          if (ps.length > 0) {
+            for (const p of ps) {
+              const t = (p.textContent || '').trim();
+              if (t) out.push(t);
+            }
+          }
+          el = el.nextElementSibling as Element | null;
         }
-        return '';
-      };
-      const accountName = getDetail('счет списания');
-      const counterparty = getDetail('получатель');
-      const counterpartyPhone = getDetail('телефон получателя');
-      const counterpartyBank = getDetail('банк получателя');
-      const message = getDetail('сообщение');
-      const fee = getDetail('комиссия');
-      const total = getDetail('сумма с учетом комиссии');
-      const channel = getDetail('тип перевода');
-      const opId = getDetail('идентификатор операции сбп');
-      return { title, textAll, category, datetimeText, amountText, accountName, counterparty, counterpartyPhone, counterpartyBank, message, fee, total, channel, opId } as any;
-    });
+        return out;
+      }, targetH2);
+      try { console.log('[vtb] extract:detail_texts_len', { index, len: detailTexts.length, sample: detailTexts.slice(0, 4) }); } catch {}
+      for (let i = 0; i < detailTexts.length - 1; i++) {
+        const a = String(detailTexts[i] ?? '');
+        const b = String(detailTexts[i + 1] ?? '');
+        const aNorm = a.trim().toLowerCase();
+        if (!aNorm || !b) continue;
+        if (aNorm === b.trim().toLowerCase()) continue;
+        detailsMap[aNorm] = b;
+      }
+    }
+    try { console.log('[vtb] extract:details_map', { index, keys: Object.keys(detailsMap) }); } catch {}
+    try { console.log('[vtb] clickAndParseItem:details_raw', { index, title, category, datetimeText, amountText, textAllLen: textAll.length }); } catch {}
+    try { console.log('[vtb] clickAndParseItem:details_map_count', { index, count: Object.keys(detailsMap).length }); } catch {}
     const parseAmount = (s: string): number => {
       const m = s.match(/([+−–-])?\s*(\d[\d\s]*)(?:[\.,](\d{2}))?/);
       if (!m) return 0;
@@ -249,52 +345,72 @@ async function clickAndParseItem(page: any, index: number): Promise<BankOperatio
       const val = Number(numStr);
       return sign * val;
     };
-    let category = String(details.category || '').trim();
-    const catM = String(details.textAll || '').match(/категория\s+([^\n]+)/i);
-    if (catM && catM[1]) category = catM[1].trim();
-    if (!category) {
-      const cs = String(details.category || '');
+    let categoryResolved = String(category || '').trim();
+    const catM = String(textAll || '').match(/категория\s+([^\n]+)/i);
+    try { console.log('[vtb] clickAndParseItem:category_initial', { index, category: categoryResolved }); } catch {}
+    if (catM && catM[1]) categoryResolved = catM[1].trim();
+    if (!categoryResolved) {
+      const cs = String(category || '');
       const idx = cs.toLowerCase().indexOf('категория');
       if (idx >= 0) {
         const before = cs.slice(0, idx).trim();
         const after = cs.slice(idx + 'категория'.length).trim();
-        category = after || before || cs.trim();
+        categoryResolved = after || before || cs.trim();
       }
     }
-    const dtM = String(details.textAll || '').match(/\d{1,2}\s+[А-Яа-я]+(?:\s+\d{4}\s*г?\.?){0,1}[,\s]+\d{1,2}:\d{2}/);
-    const dtResolved = dtM ? dtM[0].trim() : String(details.datetimeText || '');
+    try { console.log('[vtb] clickAndParseItem:category_resolved', { index, category: categoryResolved }); } catch {}
+    const dtM = String(textAll || '').match(/\d{1,2}\s+[А-Яа-я]+(?:\s+\d{4}\s*г?\.?){0,1}[,\s]+\d{1,2}:\d{2}/);
+    const dtResolved = dtM ? dtM[0].trim() : String(datetimeText || '');
     const m = dtResolved.match(/(\d{1,2})\s+([А-Яа-я]+)/);
     const rawDate = m ? `${m[1]} ${m[2]}` : dtResolved;
+    const datetime = parseRuDateTime(dtResolved);
+    try { console.log('[vtb] clickAndParseItem:datetime', { index, dtResolved, rawDate, datetime }); } catch {}
     const item: BankOperationItem = {
-      date: rawDate,
-      text: String(details.title || ''),
-      category,
-      amount: parseAmount(String(details.amountText || '')),
-      message: String(details.message || ''),
-      opTime: '',
+      date: datetime ? datetime.toISOString().slice(0, 10) : '',
+      text: String(title || ''),
+      category: categoryResolved,
+      amount: parseAmount(String(amountText || '')),
+      opTime: datetime ? datetime.toISOString().slice(11, 16) : '',
       opDateTimeText: dtResolved,
-      opId: String(details.opId || ''),
-      accountName: String(details.accountName || ''),
-      accountMask: String(details.accountName || '').match(/(\d{2}\s?\d{2}$|•\s?\d{4}$)/)?.[0] || '',
-      counterparty: String(details.counterparty || ''),
-      counterpartyPhone: String(details.counterpartyPhone || ''),
-      counterpartyBank: String(details.counterpartyBank || ''),
-      feeAmount: parseAmount(String(details.fee || '0')),
-      totalAmount: parseAmount(String(details.total || '0')),
-      channel: String(details.channel || ''),
+      accountMask: '',
+      opDateTime: datetime ? datetime.toISOString() : '',
+      details: detailsMap,
     };
-    try { console.log('[vtb] parsed', { t: item.text, cat: item.category, dt: item.opDateTimeText, amt: item.amount, id: item.opId }); } catch {}
+    try { console.log('[vtb] clickAndParseItem:amounts', { index, amountText: String(amountText || ''), amount: item.amount, fee: item.feeAmount, total: item.totalAmount }); } catch {}
+    try { console.log('[vtb] clickAndParseItem:item_fields', { index, text: item.text, category: item.category, accountName: item.accountName, counterparty: item.counterparty, channel: item.channel }); } catch {}
+    try { console.log('[vtb] parsed', { t: item.text, cat: item.category, dt: item.opDateTimeText, amt: item.amount }); } catch {}
     return item;
-  } catch {
+  } catch (e) {
+    try { console.log('[vtb] clickAndParseItem:error_parse', { index, e }); } catch {}
     return null;
   } finally {
-    try { await page.evaluate(() => history.back()); } catch {}
+    try { console.log('[vtb] clickAndParseItem:go_back', { index }); } catch {}
+    await humanPause(page, 150, 300);
+    try { await page.evaluate(() => history.back()); } catch (e) { try { console.log('[vtb] clickAndParseItem:error_history_back', { index, e }); } catch {} }
     let backWait = 0;
+    let wasReady = false;
     while (backWait < 10000) {
       const onList = await isListReady(page);
-      if (onList) break;
+      try { console.log('[vtb] clickAndParseItem:waiting_back', { index, backWait, onList }); } catch {}
+      if (onList) { wasReady = true; break; }
       await page.waitForTimeout(200);
       backWait += 200;
     }
+    try { console.log('[vtb] clickAndParseItem:back_done', { index, backWait, wasReady }); } catch {}
   }
+}
+
+function parseRuDateTime(text: string): Date | null {
+  const s = (text || '').trim().toLowerCase();
+  const m = s.match(/(\d{1,2})\s+([а-я]+)\s+(\d{4}).*?(\d{1,2}):(\d{2})/);
+  const months = ['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
+  if (!m) return null;
+  const day = Number(m[1] ?? '');
+  const monStr = m[2] ?? '';
+  const year = Number(m[3] ?? '');
+  const hh = Number(m[4] ?? '');
+  const mm = Number(m[5] ?? '');
+  const mi = months.indexOf(monStr);
+  if (!Number.isFinite(day) || !Number.isFinite(year) || mi < 0 || !Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  return new Date(year, mi, day, hh, mm);
 }

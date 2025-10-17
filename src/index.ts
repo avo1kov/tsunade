@@ -3,6 +3,7 @@ import { sendText } from './telegram.js';
 import { VtbCollector } from './banks/vtb.js';
 import type { BankOperationItem } from './banks/types.js';
 import fs from 'node:fs/promises';
+import crypto from 'node:crypto';
 
 type DbOp = {
   raw_date: string;
@@ -14,7 +15,6 @@ type DbOp = {
   message?: string | null;
   op_time?: Date | null;
   op_datetime_text?: string | null;
-  op_id?: string | null;
   account_name?: string | null;
   account_mask?: string | null;
   counterparty?: string | null;
@@ -24,6 +24,8 @@ type DbOp = {
   total_amount?: number | null;
   channel?: string | null;
   op_datetime?: Date | null;
+  details?: Record<string, string> | null;
+  id_hash?: string | null;
 };
 
 type PgPool = {
@@ -41,8 +43,8 @@ async function makePool(): Promise<PgPool> {
   return pool as PgPool;
 }
 
-async function getLatestKnown(POOL: PgPool, bank: string): Promise<{ raw_date: string; text: string; amount: number; op_id: string | null; op_datetime_text: string | null } | null> {
-  const sql = 'select raw_date, text, amount, op_id, op_datetime_text from finance.operations where bank = $1 order by id desc limit 1';
+async function getLatestKnown(POOL: PgPool, bank: string): Promise<{ raw_date: string; text: string; amount: number; op_datetime_text: string | null } | null> {
+  const sql = 'select raw_date, text, amount, op_datetime_text from finance.operations where bank = $1 order by id desc limit 1';
   const r = await POOL.query(sql, [bank]);
   if (r.rows.length === 0) return null;
   return r.rows[0];
@@ -72,9 +74,10 @@ function normalizeDate(raw: string): string {
 
 async function insertNew(POOL: PgPool, ops: DbOp[]): Promise<number> {
   if (ops.length === 0) return 0;
-  const cols = ['raw_date','op_date','text','bank_category','amount','bank','message','op_time','op_datetime_text','op_id','account_name','account_mask','counterparty','counterparty_phone','counterparty_bank','fee_amount','total_amount','channel','op_datetime'];
+  const cols = ['raw_date','op_date','text','bank_category','amount','bank','message','op_time','op_datetime_text','account_name','account_mask','counterparty','counterparty_phone','counterparty_bank','fee_amount','total_amount','channel','op_datetime','details','id_hash'];
   const valuesSql = ops.map((_, i) => '(' + cols.map((__, j) => `$${i*cols.length + j + 1}`).join(', ') + ')').join(', ');
-  const sql = `insert into finance.operations (${cols.join(', ')}) values ${valuesSql} on conflict (bank, op_id) where op_id is not null do nothing`;
+  const sql = `insert into finance.operations (${cols.join(', ')}) values ${valuesSql}
+    on conflict do nothing`;
   const params: any[] = [];
   for (const o of ops) {
     params.push(
@@ -87,7 +90,6 @@ async function insertNew(POOL: PgPool, ops: DbOp[]): Promise<number> {
       o.message ?? null,
       o.op_time ?? null,
       o.op_datetime_text ?? null,
-      o.op_id ?? null,
       o.account_name ?? null,
       o.account_mask ?? null,
       o.counterparty ?? null,
@@ -97,6 +99,8 @@ async function insertNew(POOL: PgPool, ops: DbOp[]): Promise<number> {
       o.total_amount ?? null,
       o.channel ?? null,
       o.op_datetime ?? null,
+      o.details ? JSON.stringify(o.details) : null,
+      o.id_hash ?? null,
     );
   }
   const r = await POOL.query(sql, params);
@@ -133,9 +137,8 @@ async function main(): Promise<void> {
       console.log(`[vtb] onSnapshot ${items.length} operations`);
       collected.push(...items);
       if (latest) {
-        const foundById = latest.op_id && items.some(it => (it.opId || '') === latest!.op_id);
         const foundByLegacy = items.some(it => it.date === latest!.raw_date && it.text === latest!.text && it.amount === Number(latest!.amount) && (it.opDateTimeText || '') === (latest!.op_datetime_text || ''));
-        if (foundById || foundByLegacy) throw new Error(sentinel);
+        if (foundByLegacy) throw new Error(sentinel);
       }
     };
     try {
@@ -147,16 +150,29 @@ async function main(): Promise<void> {
     const items = collected;
 
     console.log(`[vtb] collected ${items.length} operations`);
-    console.log(items);
+    // console.log(items);
 
     const newestFirst = items;
     console.log(`[vtb] newest first ${newestFirst.length} operations`);
-    console.log(newestFirst);
+    // console.log(newestFirst);
 
     const newOnly: DbOp[] = [];
     for (const it of newestFirst) {
-      const isOld = latest && ((latest.op_id && (it.opId || '') === latest.op_id) || (it.date === latest.raw_date && it.text === latest.text && it.amount === Number(latest.amount) && (it.opDateTimeText || '') === (latest.op_datetime_text || '')));
+      const isOld = latest && (it.date === latest.raw_date && it.text === latest.text && it.amount === Number(latest.amount) && (it.opDateTimeText || '') === (latest.op_datetime_text || ''));
       if (isOld) break;
+      // compute deterministic id_hash from a stable set of fields
+      const detailPairs = Object.entries(it.details || {}).filter(([k, v]) => !!k && !!v);
+      detailPairs.sort(([a], [b]) => a.localeCompare(b));
+      const identitySource = JSON.stringify({
+        text: it.text,
+        amount: it.amount,
+        opDateTimeText: it.opDateTimeText || '',
+        accountMask: it.accountMask || '',
+        counterparty: it.counterparty || '',
+        details: detailPairs,
+      });
+      const idHash = crypto.createHash('sha256').update(identitySource).digest('hex').slice(0, 24);
+
       newOnly.push({
         raw_date: it.date,
         op_date: normalizeDate(it.date),
@@ -167,7 +183,6 @@ async function main(): Promise<void> {
         message: it.message || null,
         op_time: parseRuDateTime(it.opDateTimeText || '') || null,
         op_datetime_text: it.opDateTimeText || null,
-        op_id: it.opId || null,
         account_name: it.accountName || null,
         account_mask: it.accountMask || null,
         counterparty: it.counterparty || null,
@@ -177,6 +192,8 @@ async function main(): Promise<void> {
         total_amount: typeof it.totalAmount === 'number' ? it.totalAmount : null,
         channel: it.channel || null,
         op_datetime: parseRuDateTime(it.opDateTimeText || '') || null,
+        details: it.details || null,
+        id_hash: idHash,
       });
     }
     if (newOnly.length > 0) {
