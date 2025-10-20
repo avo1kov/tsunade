@@ -104,57 +104,63 @@ export class VtbCollector implements BankCollector {
   }
 }
 
+type GeneralSeenItem = { text: string, seen: boolean, y?: number };
+
 async function collectOperationsVtb(page: any, maxPages: number, onSnapshot?: (items: BankOperationItem[]) => Promise<void> | void): Promise<BankOperationItem[]> {
   const collected: BankOperationItem[] = [];
-  let seen = 0;
+  const generalSeen: GeneralSeenItem[] = [];
 
-  for (let pageNum = 0; pageNum < maxPages; pageNum++) {
-    if (await handleReauthIfError(page)) {
-      try { console.log('[vtb] reauth triggered during collect, stopping collect'); } catch {}
-      break;
+  if (await handleReauthIfError(page)) {
+    try { console.log('[vtb] reauth triggered during collect, stopping collect'); } catch {}
+    return [];
+  }
+
+  await page.waitForSelector('main');
+
+  while (true) {
+    let itemsTexts: string[] = [];
+    let itemsLocs: any[] = [];
+    let itemsYs: number[] = [];
+    let nextIndexToCollect = -1;
+    for (let k = 0; k < 3; k++) {
+      humanPause(page, 2000, 3000);
+      const listSnapshot = await getListSnapshot(page);
+      itemsTexts = listSnapshot.texts;
+      itemsLocs = listSnapshot.locs;
+      itemsYs = listSnapshot.ys;
+      generalSeen.push(...extendGeneralSeen(generalSeen, itemsTexts, itemsYs));
+      nextIndexToCollect = getNextIndexToCollect(generalSeen, itemsTexts);
+
+      if (nextIndexToCollect > -1) break;
     }
 
-    await page.waitForSelector('main');
+    if (nextIndexToCollect < 0) break;
 
-    const itemsCount: number = await getListCount(page);
-
-    try { console.log('[vtb] itemsCount', itemsCount, 'seen', seen); } catch {}
-    if (itemsCount === 0) {
-      try { console.log('[vtb] list empty, trying slow scroll warmup'); } catch {}
-      for (let k = 0; k < 3; k++) { await scrollToLoadMore(page); }
+    const targetText = itemsTexts[nextIndexToCollect] || '';
+    // Prefer the exact handle from the same snapshot to avoid DOM drift
+    const handle = itemsLocs[nextIndexToCollect];
+    let locOrHandle: any | null = null;
+    if (handle) {
+      try {
+        const connected = await handle.evaluate((el: Element) => (el as HTMLElement).isConnected === true);
+        if (connected) locOrHandle = handle;
+      } catch {}
     }
-
-    for (let i = seen; i < itemsCount; i++) {
-      try { console.log('[vtb] process index start', i); } catch {}
-      const item = await clickAndParseItem(page, i);
-      try { console.log('[vtb] process index done', { i, ok: !!item }); } catch {}
-
-      if (item) collected.push(item);
+    if (!locOrHandle) {
+      locOrHandle = targetText
+        ? page.locator(SEL.listItem).filter({ hasText: targetText }).first()
+        : page.locator(SEL.listItem).nth(nextIndexToCollect);
+    }
+    const targetY = itemsYs[nextIndexToCollect] ?? undefined;
+    const item = await clickAndParseItem(page, locOrHandle, targetY);
+    if (item) {
+      collected.push(item);
       if (onSnapshot && collected.length % 10 === 0) await onSnapshot(collected.slice(-10));
     }
-
-    seen = itemsCount;
-
-    let grew = false;
-    for (let tries = 0; tries < 3; tries++) {
-      const before: number = await getListCount(page);
-      try { console.log('[vtb] scroll load more, before', before, 'try', tries); } catch {}
-      await scrollToLoadMore(page);
-      const after: number = await getListCount(page);
-      try { console.log('[vtb] after', after, 'try', tries); } catch {}
-      if (after > before) { grew = true; break; }
-      await page.waitForTimeout(500);
-    }
-    if (!grew) {
-      try { console.log('[vtb] no growth detected, waiting for passive load'); } catch {}
-      await page.waitForTimeout(2000);
-      const afterWait: number = await getListCount(page);
-      try { console.log('[vtb] after passive wait', afterWait, 'seen', seen); } catch {}
-      if (afterWait > seen) grew = true;
-    }
-    if (!grew) break;
+    const seenIdx = generalSeen.findIndex(s => s.text === targetText && !s.seen);
+    if (seenIdx >= 0) generalSeen[seenIdx]!.seen = true;
   }
-  await new Promise(() => {});
+
   if (onSnapshot && collected.length) await onSnapshot(collected.slice(-Math.min(collected.length, 10)));
   return collected;
 }
@@ -202,40 +208,31 @@ async function isListReady(page: any): Promise<boolean> {
   } catch { return false; }
 }
 
-async function getListCount(page: any): Promise<number> {
+type ListSnapshot = { texts: string[], locs: any[], ys: number[] };
+
+async function getListSnapshot(page: any): Promise<ListSnapshot> {
   try {
-    return await page.evaluate((sel: string) => document.querySelectorAll(sel).length, SEL.listItem);
-  } catch { return 0; }
-}
-
-async function ensureIndexLoaded(page: any, index: number, timeoutMs: number = 15000): Promise<boolean> {
-  const started = Date.now();
-  let lastCount = -1;
-  for (;;) {
-    const count = await getListCount(page);
-    try { console.log('[vtb] ensureIndexLoaded', { index, count }); } catch {}
-    if (count > index) return true;
-    if (Date.now() - started > timeoutMs) return false;
-    if (count !== lastCount) {
-      lastCount = count;
+    const rowLocator = page.locator(SEL.listItem);
+    const count = await rowLocator.count();
+    const texts: string[] = [];
+    const locs: any[] = [];
+    const ys: number[] = [];
+    for (let i = 0; i < count; i++) {
+      const handle = await rowLocator.nth(i).elementHandle();
+      if (!handle) continue;
+      const { text, y } = (await handle.evaluate((el: Element) => {
+        const t = ((el as HTMLElement).innerText || '').trim();
+        const rect = (el as HTMLElement).getBoundingClientRect();
+        const absY = Math.max(0, rect.top + (window.scrollY || window.pageYOffset || 0));
+        return { text: t, y: absY };
+      })) as { text: string, y: number };
+      if (text.length === 0) continue;
+      texts.push(text);
+      locs.push(handle);
+      ys.push(y);
     }
-    await scrollToLoadMore(page);
-    await page.waitForTimeout(500);
-  }
-}
-
-async function scrollToLoadMore(page: any): Promise<void> {
-  try { await page.click('main', { position: { x: 10, y: 10 }, timeout: 300 }); } catch {}
-
-  await humanPause(page, 150, 300);
-
-  for (let k = 0; k < 3; k++) {
-    await humanPause(page, 120, 280);
-  
-    try { await page.keyboard.press('End'); } catch {}
-  
-    await page.waitForTimeout(3000);
-  }
+    return { texts, locs, ys };
+  } catch { return { texts: [], locs: [], ys: [] }; }
 }
 
 async function fillPhoneAndContinue(page: any, phone: string): Promise<boolean> {
@@ -273,32 +270,23 @@ async function enterPinIfPresent(page: any): Promise<boolean> {
   return true;
 }
 
-async function clickAndParseItem(page: any, index: number): Promise<BankOperationItem | null> {
+async function clickAndParseItem(page: any, loc: any, returnScrollY?: number): Promise<BankOperationItem | null> {
   // click on item
   try {
-    try { console.log('[vtb] clickAndParseItem:start', { index }); } catch {}
     console.log('-------------------------------------------')
-    await ensureIndexLoaded(page, index);
-    const items = await page.$$(SEL.listItem);
-    try { console.log('[vtb] clickAndParseItem:items_len', { index, len: items?.length ?? 0 }); } catch {}
-    if (!items[index]) {
-      try { console.log('[vtb] clickAndParseItem:no_btn', { index }); } catch {}
-      return null;
+    await humanPause(page, 2000, 2400);
+    if (typeof returnScrollY === 'number' && Number.isFinite(returnScrollY)) {
+      try {
+        await page.evaluate((y: number) => { window.scrollTo(0, Math.max(0, y)); }, returnScrollY);
+      } catch {}
     }
-
-    await humanPause(page, 120, 200);
-
-    const loc = page.locator(SEL.listItem).nth(index);
-    try { await page.click('main', { position: { x: 10, y: 10 }, timeout: 300 }); } catch {}
-    await loc.scrollIntoViewIfNeeded();
-    await loc.evaluate((el: Element) => (el as HTMLElement).scrollIntoView({ block: 'center', inline: 'nearest' }));
-    try { console.log('[vtb] clickAndParseItem:scrolled', { index }); } catch {}
+    try { console.log('[vtb] clickAndParseItem:scrolled'); } catch {}
 
     await humanPause(page, 1000, 1500);
     
     await loc.click();
-    try { console.log('[vtb] clickAndParseItem:clicked', { index }); } catch {}
-  } catch (e) { try { console.log('[vtb] clickAndParseItem:error_click', { index, e }); } catch {} return null; }
+    try { console.log('[vtb] clickAndParseItem:clicked'); } catch {}
+  } catch (e) { try { console.log('[vtb] clickAndParseItem:error_click', { e }); } catch {} return null; }
   // wait for details
   try {
     // try { console.log('[vtb] clickAndParseItem:wait_details_header', { index }); } catch {}
@@ -309,17 +297,17 @@ async function clickAndParseItem(page: any, index: number): Promise<BankOperatio
     }, SEL.detailsHeader);
     // try { console.log('[vtb] clickAndParseItem:details_header_ok', { index, ok }); } catch {}
     if (!ok) {
-      try { console.log('[vtb] clickAndParseItem:details_header_not_ready', { index }); } catch {}
+      try { console.log('[vtb] clickAndParseItem:details_header_not_ready'); } catch {}
       return null;
     }
-  } catch (e) { try { console.log('[vtb] clickAndParseItem:error_wait_details', { index, e }); } catch {} return null; }
+  } catch (e) { try { console.log('[vtb] clickAndParseItem:error_wait_details', { e }); } catch {} return null; }
   // collect details
   try {
     // try { console.log('[vtb] clickAndParseItem:extract_details', { index }); } catch {}
     // try { console.log('[vtb] extract:h1_wait', { index }); } catch {}
     const h1Handle = await page.waitForSelector('main h1', { timeout: 1000 }).catch(() => null);
     const title = h1Handle ? await page.evaluate((el: Element) => (el.textContent || '').trim(), h1Handle) : '';
-    try { console.log('[vtb] extract:title', { index, title }); } catch {}
+    try { console.log('[vtb] extract:title', { title }); } catch {}
     const mainEl = await page.waitForSelector('main', { timeout: 1000 }).catch(() => null);
     const textAll = mainEl ? await page.evaluate((el: Element) => (el as any).innerText || '', mainEl) : '';
     // try { console.log('[vtb] extract:textAll_len', { index, len: textAll.length }); } catch {}
@@ -425,27 +413,22 @@ async function clickAndParseItem(page: any, index: number): Promise<BankOperatio
     // try { console.log('[vtb] parsed', { t: item.text, cat: item.category, dt: item.opDateTimeText, amt: item.amount }); } catch {}
     return item;
   } catch (e) {
-    try { console.log('[vtb] clickAndParseItem:error_parse', { index, e }); } catch {}
+    try { console.log('[vtb] clickAndParseItem:error_parse', { e }); } catch {}
     return null;
   } finally {
-    try { console.log('[vtb] clickAndParseItem:go_back', { index }); } catch {}
+    try { console.log('[vtb] clickAndParseItem:go_back'); } catch {}
     await humanPause(page, 1500, 2000);
-    try { await page.evaluate(() => history.back()); } catch (e) { try { console.log('[vtb] clickAndParseItem:error_history_back', { index, e }); } catch {} }
+    try { await page.evaluate(() => history.back()); } catch (e) { try { console.log('[vtb] clickAndParseItem:error_history_back', { e }); } catch {} }
     let backWait = 0;
     let wasReady = false;
     while (backWait < 10000) {
       const onList = await isListReady(page);
-      try { console.log('[vtb] clickAndParseItem:waiting_back', { index, backWait, onList }); } catch {}
+      try { console.log('[vtb] clickAndParseItem:waiting_back', { backWait, onList }); } catch {}
       if (onList) { wasReady = true; break; }
       await page.waitForTimeout(200);
       backWait += 200;
     }
-    try { console.log('[vtb] clickAndParseItem:back_done', { index, backWait, wasReady }); } catch {}
-    // Ensure the last seen item is loaded; scroll down until it appears
-    try {
-      const ok = await ensureIndexLoaded(page, index, 10000);
-      try { console.log('[vtb] clickAndParseItem:ensure_last_seen_loaded', { index, ok }); } catch {}
-    } catch {}
+    try { console.log('[vtb] clickAndParseItem:back_done', { backWait, wasReady }); } catch {}
   }
 }
 
@@ -462,4 +445,46 @@ function parseRuDateTime(text: string): Date | null {
   const mi = months.indexOf(monStr);
   if (!Number.isFinite(day) || !Number.isFinite(year) || mi < 0 || !Number.isFinite(hh) || !Number.isFinite(mm)) return null;
   return new Date(year, mi, day, hh, mm);
+}
+
+function extendGeneralSeen(generalSeenArray: GeneralSeenItem[], itemsTexts: string[], itemsYs: number[]): GeneralSeenItem[] {
+  const tempGeneralSeen = generalSeenArray.map(item => ({ ...item, checked: false }));
+  const newGeneralSeen: GeneralSeenItem[] = [];
+  const newItemsTexts: string[] = [...itemsTexts];
+  const newItemsYs: number[] = [...itemsYs];
+
+  for (let i = 0; i < itemsTexts.length; i++) {
+    const text = itemsTexts[i]!;
+    const uncheckedIndex = tempGeneralSeen.findIndex(item => item.text === text && !item.checked);
+    if (uncheckedIndex >= 0) {
+      tempGeneralSeen[uncheckedIndex]!.checked = true;
+      const existedTextIndex = newItemsTexts.indexOf(text);
+      if (existedTextIndex >= 0) {
+        newItemsTexts.splice(existedTextIndex, 1);
+        newItemsYs.splice(existedTextIndex, 1);
+      }
+    }
+  }
+
+  newItemsTexts.forEach((text, idx) => {
+    const y = newItemsYs[idx];
+    const item: GeneralSeenItem = Number.isFinite(y) ? { text, seen: false, y: y as number } : { text, seen: false };
+    newGeneralSeen.push(item);
+  });
+
+  console.log('[vtb] extendGeneralSeen', { newItemsTexts });
+
+  return newGeneralSeen;
+}
+
+function getNextIndexToCollect(generalSeen: GeneralSeenItem[], itemsTexts: string[]): number {
+  for (let i = 0; i < itemsTexts.length; i++) {
+    const text = itemsTexts[i]!;
+    const seenItem = generalSeen.find(item => item.text === text && !item.seen);
+    if (seenItem) {
+      console.log('[vtb] getNextIndexToCollect', { i, text });
+      return i;
+    }
+  }
+  return -1;
 }
