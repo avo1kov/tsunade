@@ -11,7 +11,8 @@ const SEL = {
   otpInput: '[data-test-id="auth-passcode"] input[name="otpInput"]',
   phoneInput: 'input[type="tel"], input[name*="phone"], input[placeholder*="телефон"]',
   listItem: '[data-test-id="operationwrapper_operationitemmsa"]',
-  detailsHeader: 'main h1'
+  detailsHeader: 'main h1',
+  backToLoginBtn: '[data-test-id="back-to-login_button"]'
 } as const;
 
 async function humanPause(page: any, base: number = 200, jitter: number = 300): Promise<void> {
@@ -56,7 +57,14 @@ export class VtbCollector implements BankCollector {
     let didPin = false;
     const started = Date.now();
     for (;;) {
-      if (await hasFatalError(this.driver.page)) await new Promise(() => {});
+      if (await handleReauthIfError(this.driver.page)) {
+        didPhone = false;
+        didOtp = false;
+        didPin = false;
+        try { await this.driver.page.waitForLoadState('domcontentloaded'); } catch {}
+        await this.driver.page.waitForTimeout(500);
+        continue;
+      }
 
       try {
         if (phoneEnv && !didPhone) didPhone = await fillPhoneAndContinue(this.driver.page, phoneEnv);
@@ -101,12 +109,12 @@ async function collectOperationsVtb(page: any, maxPages: number, onSnapshot?: (i
   let seen = 0;
 
   for (let pageNum = 0; pageNum < maxPages; pageNum++) {
-    try { console.log('[vtb] collect page', pageNum); } catch {}
-
-    if (await hasFatalError(page)) await new Promise(() => {});
+    if (await handleReauthIfError(page)) {
+      try { console.log('[vtb] reauth triggered during collect, stopping collect'); } catch {}
+      break;
+    }
 
     await page.waitForSelector('main');
-    try { console.log('[vtb] list main ready'); } catch {}
 
     const itemsCount: number = await getListCount(page);
 
@@ -128,17 +136,25 @@ async function collectOperationsVtb(page: any, maxPages: number, onSnapshot?: (i
     seen = itemsCount;
 
     let grew = false;
-    for (let tries = 0; tries < 8; tries++) {
+    for (let tries = 0; tries < 3; tries++) {
       const before: number = await getListCount(page);
       try { console.log('[vtb] scroll load more, before', before, 'try', tries); } catch {}
       await scrollToLoadMore(page);
       const after: number = await getListCount(page);
       try { console.log('[vtb] after', after, 'try', tries); } catch {}
       if (after > before) { grew = true; break; }
-      await page.waitForTimeout(1200);
+      await page.waitForTimeout(500);
+    }
+    if (!grew) {
+      try { console.log('[vtb] no growth detected, waiting for passive load'); } catch {}
+      await page.waitForTimeout(2000);
+      const afterWait: number = await getListCount(page);
+      try { console.log('[vtb] after passive wait', afterWait, 'seen', seen); } catch {}
+      if (afterWait > seen) grew = true;
     }
     if (!grew) break;
   }
+  await new Promise(() => {});
   if (onSnapshot && collected.length) await onSnapshot(collected.slice(-Math.min(collected.length, 10)));
   return collected;
 }
@@ -147,6 +163,37 @@ async function hasFatalError(page: any): Promise<boolean> {
   try {
     return await page.evaluate(() => /произош[ёе]л\s+сбой/i.test(document.body.innerText || ''));
   } catch { return false; }
+}
+
+async function handleReauthIfError(page: any): Promise<boolean> {
+  let fatal = false;
+  try { fatal = await hasFatalError(page); } catch { fatal = false; }
+  if (!fatal) return false;
+  try { console.log('[vtb] fatal error detected, attempting back-to-login'); } catch {}
+  try {
+    const btn = await page.waitForSelector(SEL.backToLoginBtn, { timeout: 1500 }).catch(() => null);
+    if (btn) {
+      await humanPause(page, 120, 240);
+      try { await btn.click({ timeout: 1000 }); } catch {}
+      try { await page.waitForLoadState('domcontentloaded'); } catch {}
+      await humanPause(page, 150, 300);
+      return true;
+    }
+  } catch {}
+  try {
+    const clicked = await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button')) as HTMLElement[];
+      const target = btns.find(b => /вернуться\s+к\s+входу/i.test((b.textContent || '').trim()));
+      if (target) { target.click(); return true; }
+      return false;
+    });
+    if (clicked) {
+      try { await page.waitForLoadState('domcontentloaded'); } catch {}
+      await humanPause(page, 150, 300);
+      return true;
+    }
+  } catch {}
+  return false;
 }
 
 async function isListReady(page: any): Promise<boolean> {
@@ -161,13 +208,33 @@ async function getListCount(page: any): Promise<number> {
   } catch { return 0; }
 }
 
+async function ensureIndexLoaded(page: any, index: number, timeoutMs: number = 15000): Promise<boolean> {
+  const started = Date.now();
+  let lastCount = -1;
+  for (;;) {
+    const count = await getListCount(page);
+    try { console.log('[vtb] ensureIndexLoaded', { index, count }); } catch {}
+    if (count > index) return true;
+    if (Date.now() - started > timeoutMs) return false;
+    if (count !== lastCount) {
+      lastCount = count;
+    }
+    await scrollToLoadMore(page);
+    await page.waitForTimeout(500);
+  }
+}
+
 async function scrollToLoadMore(page: any): Promise<void> {
   try { await page.click('main', { position: { x: 10, y: 10 }, timeout: 300 }); } catch {}
+
   await humanPause(page, 150, 300);
+
   for (let k = 0; k < 3; k++) {
     await humanPause(page, 120, 280);
+  
     try { await page.keyboard.press('End'); } catch {}
-    await page.waitForTimeout(10000);
+  
+    await page.waitForTimeout(3000);
   }
 }
 
@@ -207,54 +274,63 @@ async function enterPinIfPresent(page: any): Promise<boolean> {
 }
 
 async function clickAndParseItem(page: any, index: number): Promise<BankOperationItem | null> {
+  // click on item
   try {
     try { console.log('[vtb] clickAndParseItem:start', { index }); } catch {}
+    console.log('-------------------------------------------')
+    await ensureIndexLoaded(page, index);
     const items = await page.$$(SEL.listItem);
     try { console.log('[vtb] clickAndParseItem:items_len', { index, len: items?.length ?? 0 }); } catch {}
     if (!items[index]) {
       try { console.log('[vtb] clickAndParseItem:no_btn', { index }); } catch {}
       return null;
     }
+
     await humanPause(page, 120, 200);
+
     const loc = page.locator(SEL.listItem).nth(index);
     try { await page.click('main', { position: { x: 10, y: 10 }, timeout: 300 }); } catch {}
     await loc.scrollIntoViewIfNeeded();
     await loc.evaluate((el: Element) => (el as HTMLElement).scrollIntoView({ block: 'center', inline: 'nearest' }));
     try { console.log('[vtb] clickAndParseItem:scrolled', { index }); } catch {}
-    await humanPause(page, 150, 350);
+
+    await humanPause(page, 1000, 1500);
+    
     await loc.click();
     try { console.log('[vtb] clickAndParseItem:clicked', { index }); } catch {}
   } catch (e) { try { console.log('[vtb] clickAndParseItem:error_click', { index, e }); } catch {} return null; }
+  // wait for details
   try {
-    try { console.log('[vtb] clickAndParseItem:wait_details_header', { index }); } catch {}
+    // try { console.log('[vtb] clickAndParseItem:wait_details_header', { index }); } catch {}
     const ok = await page.evaluate((sel: string) => {
       const h = document.querySelector(sel);
       const t = h ? (h.textContent || '').trim() : '';
       return !!h && t.length > 0;
     }, SEL.detailsHeader);
-    try { console.log('[vtb] clickAndParseItem:details_header_ok', { index, ok }); } catch {}
+    // try { console.log('[vtb] clickAndParseItem:details_header_ok', { index, ok }); } catch {}
     if (!ok) {
       try { console.log('[vtb] clickAndParseItem:details_header_not_ready', { index }); } catch {}
       return null;
     }
   } catch (e) { try { console.log('[vtb] clickAndParseItem:error_wait_details', { index, e }); } catch {} return null; }
+  // collect details
   try {
-    try { console.log('[vtb] clickAndParseItem:extract_details', { index }); } catch {}
-    try { console.log('[vtb] extract:h1_wait', { index }); } catch {}
+    // try { console.log('[vtb] clickAndParseItem:extract_details', { index }); } catch {}
+    // try { console.log('[vtb] extract:h1_wait', { index }); } catch {}
     const h1Handle = await page.waitForSelector('main h1', { timeout: 1000 }).catch(() => null);
     const title = h1Handle ? await page.evaluate((el: Element) => (el.textContent || '').trim(), h1Handle) : '';
     try { console.log('[vtb] extract:title', { index, title }); } catch {}
     const mainEl = await page.waitForSelector('main', { timeout: 1000 }).catch(() => null);
     const textAll = mainEl ? await page.evaluate((el: Element) => (el as any).innerText || '', mainEl) : '';
-    try { console.log('[vtb] extract:textAll_len', { index, len: textAll.length }); } catch {}
+    // try { console.log('[vtb] extract:textAll_len', { index, len: textAll.length }); } catch {}
     const pEls = await page.$$('main p');
-    try { console.log('[vtb] extract:p_count', { index, count: pEls.length }); } catch {}
+    // try { console.log('[vtb] extract:p_count', { index, count: pEls.length }); } catch {}
     const pTexts: string[] = [];
     for (const p of pEls) {
       const t = await page.evaluate((el: Element) => (el.textContent || '').trim(), p);
       if (t) pTexts.push(t);
     }
-    try { console.log('[vtb] extract:p_texts_len', { index, len: pTexts.length, sample: pTexts.slice(0, 3) }); } catch {}
+    // try { console.log('[vtb] extract:p_texts_len', { index, len: pTexts.length, sample: pTexts.slice(0, 3) }); } catch {}
     let category = '';
     let datetimeText = '';
     let amountText = '';
@@ -263,15 +339,15 @@ async function clickAndParseItem(page: any, index: number): Promise<BankOperatio
       if (!datetimeText && /\d{1,2}\s+[А-Яа-я]+.*\d{1,2}:\d{2}/.test(t)) datetimeText = t;
       if (!amountText && t.includes('₽')) amountText = t;
     }
-    try { console.log('[vtb] extract:derived', { index, category, datetimeText, amountText }); } catch {}
+    // try { console.log('[vtb] extract:derived', { index, category, datetimeText, amountText }); } catch {}
     const h2Els = await page.$$('main h2');
-    try { console.log('[vtb] extract:h2_count', { index, count: h2Els.length }); } catch {}
+    // try { console.log('[vtb] extract:h2_count', { index, count: h2Els.length }); } catch {}
     let detailsIndex = -1;
     for (let i = 0; i < h2Els.length; i++) {
       const t = await page.evaluate((el: Element) => (el.textContent || '').trim().toLowerCase(), h2Els[i]);
       if (t === 'детали операции') { detailsIndex = i; break; }
     }
-    try { console.log('[vtb] extract:details_index', { index, detailsIndex }); } catch {}
+    // try { console.log('[vtb] extract:details_index', { index, detailsIndex }); } catch {}
     const detailsMap: Record<string, string> = {};
     if (detailsIndex >= 0) {
       const targetH2 = h2Els[detailsIndex];
@@ -290,7 +366,7 @@ async function clickAndParseItem(page: any, index: number): Promise<BankOperatio
         }
         return out;
       }, targetH2);
-      try { console.log('[vtb] extract:detail_texts_len', { index, len: detailTexts.length, sample: detailTexts.slice(0, 4) }); } catch {}
+      // try { console.log('[vtb] extract:detail_texts_len', { index, len: detailTexts.length, sample: detailTexts.slice(0, 4) }); } catch {}
       for (let i = 0; i < detailTexts.length - 1; i++) {
         const a = String(detailTexts[i] ?? '');
         const b = String(detailTexts[i + 1] ?? '');
@@ -300,9 +376,9 @@ async function clickAndParseItem(page: any, index: number): Promise<BankOperatio
         detailsMap[aNorm] = b;
       }
     }
-    try { console.log('[vtb] extract:details_map', { index, keys: Object.keys(detailsMap) }); } catch {}
-    try { console.log('[vtb] clickAndParseItem:details_raw', { index, title, category, datetimeText, amountText, textAllLen: textAll.length }); } catch {}
-    try { console.log('[vtb] clickAndParseItem:details_map_count', { index, count: Object.keys(detailsMap).length }); } catch {}
+    // try { console.log('[vtb] extract:details_map', { index, keys: Object.keys(detailsMap) }); } catch {}
+    // try { console.log('[vtb] clickAndParseItem:details_raw', { index, title, category, datetimeText, amountText, textAllLen: textAll.length }); } catch {}
+    // try { console.log('[vtb] clickAndParseItem:details_map_count', { index, count: Object.keys(detailsMap).length }); } catch {}
     const parseAmount = (s: string): number => {
       const m = s.match(/([+−–-])?\s*(\d[\d\s]*)(?:[\.,](\d{2}))?/);
       if (!m) return 0;
@@ -315,7 +391,7 @@ async function clickAndParseItem(page: any, index: number): Promise<BankOperatio
     };
     let categoryResolved = String(category || '').trim();
     const catM = String(textAll || '').match(/категория\s+([^\n]+)/i);
-    try { console.log('[vtb] clickAndParseItem:category_initial', { index, category: categoryResolved }); } catch {}
+    // try { console.log('[vtb] clickAndParseItem:category_initial', { index, category: categoryResolved }); } catch {}
     if (catM && catM[1]) categoryResolved = catM[1].trim();
     if (!categoryResolved) {
       const cs = String(category || '');
@@ -326,13 +402,13 @@ async function clickAndParseItem(page: any, index: number): Promise<BankOperatio
         categoryResolved = after || before || cs.trim();
       }
     }
-    try { console.log('[vtb] clickAndParseItem:category_resolved', { index, category: categoryResolved }); } catch {}
+    // try { console.log('[vtb] clickAndParseItem:category_resolved', { index, category: categoryResolved }); } catch {}
     const dtM = String(textAll || '').match(/\d{1,2}\s+[А-Яа-я]+(?:\s+\d{4}\s*г?\.?){0,1}[,\s]+\d{1,2}:\d{2}/);
     const dtResolved = dtM ? dtM[0].trim() : String(datetimeText || '');
     const m = dtResolved.match(/(\d{1,2})\s+([А-Яа-я]+)/);
     const rawDate = m ? `${m[1]} ${m[2]}` : dtResolved;
     const datetime = parseRuDateTime(dtResolved);
-    try { console.log('[vtb] clickAndParseItem:datetime', { index, dtResolved, rawDate, datetime }); } catch {}
+    // try { console.log('[vtb] clickAndParseItem:datetime', { index, dtResolved, rawDate, datetime }); } catch {}
     const item: BankOperationItem = {
       date: datetime ? datetime.toISOString().slice(0, 10) : '',
       text: String(title || ''),
@@ -344,16 +420,16 @@ async function clickAndParseItem(page: any, index: number): Promise<BankOperatio
       opDateTime: datetime ? datetime.toISOString() : '',
       details: detailsMap,
     };
-    try { console.log('[vtb] clickAndParseItem:amounts', { index, amountText: String(amountText || ''), amount: item.amount, fee: item.feeAmount, total: item.totalAmount }); } catch {}
-    try { console.log('[vtb] clickAndParseItem:item_fields', { index, text: item.text, category: item.category, accountName: item.accountName, counterparty: item.counterparty, channel: item.channel }); } catch {}
-    try { console.log('[vtb] parsed', { t: item.text, cat: item.category, dt: item.opDateTimeText, amt: item.amount }); } catch {}
+    // try { console.log('[vtb] clickAndParseItem:amounts', { index, amountText: String(amountText || ''), amount: item.amount, fee: item.feeAmount, total: item.totalAmount }); } catch {}
+    // try { console.log('[vtb] clickAndParseItem:item_fields', { index, text: item.text, category: item.category, accountName: item.accountName, counterparty: item.counterparty, channel: item.channel }); } catch {}
+    // try { console.log('[vtb] parsed', { t: item.text, cat: item.category, dt: item.opDateTimeText, amt: item.amount }); } catch {}
     return item;
   } catch (e) {
     try { console.log('[vtb] clickAndParseItem:error_parse', { index, e }); } catch {}
     return null;
   } finally {
     try { console.log('[vtb] clickAndParseItem:go_back', { index }); } catch {}
-    await humanPause(page, 150, 300);
+    await humanPause(page, 1500, 2000);
     try { await page.evaluate(() => history.back()); } catch (e) { try { console.log('[vtb] clickAndParseItem:error_history_back', { index, e }); } catch {} }
     let backWait = 0;
     let wasReady = false;
@@ -365,6 +441,11 @@ async function clickAndParseItem(page: any, index: number): Promise<BankOperatio
       backWait += 200;
     }
     try { console.log('[vtb] clickAndParseItem:back_done', { index, backWait, wasReady }); } catch {}
+    // Ensure the last seen item is loaded; scroll down until it appears
+    try {
+      const ok = await ensureIndexLoaded(page, index, 10000);
+      try { console.log('[vtb] clickAndParseItem:ensure_last_seen_loaded', { index, ok }); } catch {}
+    } catch {}
   }
 }
 
