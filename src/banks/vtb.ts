@@ -104,7 +104,7 @@ export class VtbCollector implements BankCollector {
   }
 }
 
-type GeneralSeenItem = { text: string, seen: boolean, y?: number };
+type GeneralSeenItem = { text: string, seen: boolean, y?: number, loc?: any };
 
 async function collectOperationsVtb(page: any, maxPages: number, onSnapshot?: (items: BankOperationItem[]) => Promise<void> | void): Promise<BankOperationItem[]> {
   const collected: BankOperationItem[] = [];
@@ -118,27 +118,31 @@ async function collectOperationsVtb(page: any, maxPages: number, onSnapshot?: (i
   await page.waitForSelector('main');
 
   while (true) {
-    let itemsTexts: string[] = [];
-    let itemsLocs: any[] = [];
-    let itemsYs: number[] = [];
     let nextIndexToCollect = -1;
+    let lastSnapshot: GeneralSeenItem[] = [];
     for (let k = 0; k < 3; k++) {
-      humanPause(page, 2000, 3000);
-      const listSnapshot = await getListSnapshot(page);
-      itemsTexts = listSnapshot.texts;
-      itemsLocs = listSnapshot.locs;
-      itemsYs = listSnapshot.ys;
-      generalSeen.push(...extendGeneralSeen(generalSeen, itemsTexts, itemsYs));
-      nextIndexToCollect = getNextIndexToCollect(generalSeen, itemsTexts);
+      await humanPause(page, 1000, 1500);
+      lastSnapshot = await getGeneralSeenSnapshot(page);
+      generalSeen.push(...extendGeneralSeen(generalSeen, lastSnapshot));
+      nextIndexToCollect = getNextIndexToCollect(generalSeen, lastSnapshot);
 
       if (nextIndexToCollect > -1) break;
     }
 
     if (nextIndexToCollect < 0) break;
 
-    const targetText = itemsTexts[nextIndexToCollect] || '';
+    // Refresh handle/y from the latest snapshot to avoid DOM drift/virtualization issues
+    const gs = generalSeen[nextIndexToCollect]!;
+    const jFromSnap = (typeof gs.y === 'number') ? findIndexByY(lastSnapshot, gs.y as number) : -1;
+    if (jFromSnap >= 0) {
+      try {
+        gs.loc = lastSnapshot[jFromSnap]!.loc;
+        if (typeof lastSnapshot[jFromSnap]!.y === 'number') gs.y = lastSnapshot[jFromSnap]!.y;
+      } catch {}
+    }
+    const targetText = gs?.text || '';
     // Prefer the exact handle from the same snapshot to avoid DOM drift
-    const handle = itemsLocs[nextIndexToCollect];
+    const handle = gs?.loc;
     let locOrHandle: any | null = null;
     if (handle) {
       try {
@@ -147,18 +151,27 @@ async function collectOperationsVtb(page: any, maxPages: number, onSnapshot?: (i
       } catch {}
     }
     if (!locOrHandle) {
-      locOrHandle = targetText
-        ? page.locator(SEL.listItem).filter({ hasText: targetText }).first()
-        : page.locator(SEL.listItem).nth(nextIndexToCollect);
+      if (targetText) {
+        const keyParts = pickKeyPartsForMatch(targetText);
+        let loc = page.locator(SEL.listItem);
+        for (const part of keyParts) {
+          const re = new RegExp(escapeForRegex(part).replace(/\s+/g, '\\s+'), 'i');
+          loc = loc.filter({ hasText: re });
+        }
+        locOrHandle = loc.first();
+      } else {
+        locOrHandle = page.locator(SEL.listItem).nth(nextIndexToCollect);
+      }
     }
-    const targetY = itemsYs[nextIndexToCollect] ?? undefined;
+    const targetY = gs?.y ?? undefined;
+
     const item = await clickAndParseItem(page, locOrHandle, targetY);
+
     if (item) {
       collected.push(item);
       if (onSnapshot && collected.length % 10 === 0) await onSnapshot(collected.slice(-10));
     }
-    const seenIdx = generalSeen.findIndex(s => s.text === targetText && !s.seen);
-    if (seenIdx >= 0) generalSeen[seenIdx]!.seen = true;
+    generalSeen[nextIndexToCollect]!.seen = true;
   }
 
   if (onSnapshot && collected.length) await onSnapshot(collected.slice(-Math.min(collected.length, 10)));
@@ -235,6 +248,29 @@ async function getListSnapshot(page: any): Promise<ListSnapshot> {
   } catch { return { texts: [], locs: [], ys: [] }; }
 }
 
+// Returns an array of GeneralSeenItem built from the current list snapshot
+async function getGeneralSeenSnapshot(page: any): Promise<GeneralSeenItem[]> {
+  try {
+    const rowLocator = page.locator(SEL.listItem);
+    const count = await rowLocator.count();
+    const out: GeneralSeenItem[] = [];
+    for (let i = 0; i < count; i++) {
+      const handle = await rowLocator.nth(i).elementHandle();
+      if (!handle) continue;
+      const { text, y } = (await handle.evaluate((el: Element) => {
+        const t = ((el as HTMLElement).innerText || '').trim();
+        const rect = (el as HTMLElement).getBoundingClientRect();
+        const absY = Math.max(0, rect.top + (window.scrollY || window.pageYOffset || 0));
+        return { text: t, y: absY };
+      })) as { text: string, y: number };
+      if (!text) continue;
+      const item: GeneralSeenItem = Number.isFinite(y) ? { text, seen: false, y, loc: handle } : { text, seen: false, loc: handle };
+      out.push(item);
+    }
+    return out;
+  } catch { return []; }
+}
+
 async function fillPhoneAndContinue(page: any, phone: string): Promise<boolean> {
   const input = await page.waitForSelector(SEL.phoneInput, { timeout: 1000 }).catch(() => null);
   if (!input) return false;
@@ -274,15 +310,15 @@ async function clickAndParseItem(page: any, loc: any, returnScrollY?: number): P
   // click on item
   try {
     console.log('-------------------------------------------')
-    await humanPause(page, 2000, 2400);
+    await humanPause(page, 1200, 2000);
     if (typeof returnScrollY === 'number' && Number.isFinite(returnScrollY)) {
       try {
-        await page.evaluate((y: number) => { window.scrollTo(0, Math.max(0, y)); }, returnScrollY);
+        await page.evaluate((y: number) => { window.scrollTo(0, Math.max(0, y - 80)); }, returnScrollY);
       } catch {}
     }
     try { console.log('[vtb] clickAndParseItem:scrolled'); } catch {}
 
-    await humanPause(page, 1000, 1500);
+    await humanPause(page, 200, 800);
     
     await loc.click();
     try { console.log('[vtb] clickAndParseItem:clicked'); } catch {}
@@ -402,9 +438,7 @@ async function clickAndParseItem(page: any, loc: any, returnScrollY?: number): P
       text: String(title || ''),
       category: categoryResolved,
       amount: parseAmount(String(amountText || '')),
-      opTime: datetime ? datetime.toISOString().slice(11, 16) : '',
       opDateTimeText: dtResolved,
-      accountMask: '',
       opDateTime: datetime ? datetime.toISOString() : '',
       details: detailsMap,
     };
@@ -418,7 +452,9 @@ async function clickAndParseItem(page: any, loc: any, returnScrollY?: number): P
   } finally {
     try { console.log('[vtb] clickAndParseItem:go_back'); } catch {}
     await humanPause(page, 1500, 2000);
+
     try { await page.evaluate(() => history.back()); } catch (e) { try { console.log('[vtb] clickAndParseItem:error_history_back', { e }); } catch {} }
+
     let backWait = 0;
     let wasReady = false;
     while (backWait < 10000) {
@@ -447,14 +483,15 @@ function parseRuDateTime(text: string): Date | null {
   return new Date(year, mi, day, hh, mm);
 }
 
-function extendGeneralSeen(generalSeenArray: GeneralSeenItem[], itemsTexts: string[], itemsYs: number[]): GeneralSeenItem[] {
+function extendGeneralSeen(generalSeenArray: GeneralSeenItem[], lastSnapshot: GeneralSeenItem[]): GeneralSeenItem[] {
   const tempGeneralSeen = generalSeenArray.map(item => ({ ...item, checked: false }));
   const newGeneralSeen: GeneralSeenItem[] = [];
-  const newItemsTexts: string[] = [...itemsTexts];
-  const newItemsYs: number[] = [...itemsYs];
+  const newItemsTexts: string[] = [...lastSnapshot.map(s => s.text)];
+  const newItemsYs: number[] = [...lastSnapshot.map(s => (typeof s.y === 'number' ? s.y : NaN))];
+  const newItemsLocs: any[] = [...lastSnapshot.map(s => s.loc)];
 
-  for (let i = 0; i < itemsTexts.length; i++) {
-    const text = itemsTexts[i]!;
+  for (let i = 0; i < lastSnapshot.length; i++) {
+    const text = lastSnapshot[i]!.text;
     const uncheckedIndex = tempGeneralSeen.findIndex(item => item.text === text && !item.checked);
     if (uncheckedIndex >= 0) {
       tempGeneralSeen[uncheckedIndex]!.checked = true;
@@ -468,7 +505,8 @@ function extendGeneralSeen(generalSeenArray: GeneralSeenItem[], itemsTexts: stri
 
   newItemsTexts.forEach((text, idx) => {
     const y = newItemsYs[idx];
-    const item: GeneralSeenItem = Number.isFinite(y) ? { text, seen: false, y: y as number } : { text, seen: false };
+    const loc = newItemsLocs[idx];
+    const item: GeneralSeenItem = Number.isFinite(y) ? { text, seen: false, y: y as number, loc } : { text, seen: false, loc };
     newGeneralSeen.push(item);
   });
 
@@ -477,14 +515,49 @@ function extendGeneralSeen(generalSeenArray: GeneralSeenItem[], itemsTexts: stri
   return newGeneralSeen;
 }
 
-function getNextIndexToCollect(generalSeen: GeneralSeenItem[], itemsTexts: string[]): number {
-  for (let i = 0; i < itemsTexts.length; i++) {
-    const text = itemsTexts[i]!;
-    const seenItem = generalSeen.find(item => item.text === text && !item.seen);
-    if (seenItem) {
-      console.log('[vtb] getNextIndexToCollect', { i, text });
+function getNextIndexToCollect(generalSeen: GeneralSeenItem[], lastSnapshot: GeneralSeenItem[]): number {
+  for (let i = 0; i < generalSeen.length; i++) {
+    const gs = generalSeen[i]!;
+    if (gs.seen) continue;
+    const j = lastSnapshot.findIndex(s => s.text === gs.text);
+    if (j >= 0) {
+      console.log('~ ~')
+      console.log(generalSeen.map(s => ({ text: s.text.slice(0, 15), y: s.y, seen: s.seen })))
+      console.log('~ ~')
+      console.log(lastSnapshot.map(s => ({ text: s.text.slice(0, 15), y: s.y })))
+      console.log('~ ~')
+      console.log('[vtb] getNextIndexToCollect', { i, text: gs.text });
       return i;
     }
   }
   return -1;
+}
+
+function escapeForRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function pickKeyPartsForMatch(full: string): string[] {
+  const norm = full.replace(/\s+/g, ' ').trim();
+  // Heuristics: prefer counterparty and amount strings, which are typically distinct
+  const lines = norm.split(/\n+/).map(s => s.trim()).filter(Boolean);
+  const parts: string[] = [];
+  for (const ln of lines) {
+    if (/₽|руб/i.test(ln)) { parts.push(ln); break; }
+  }
+  if (lines.length > 0) parts.unshift(lines[0]!);
+  return Array.from(new Set(parts)).slice(0, 2);
+}
+
+function findIndexByY(snapshot: GeneralSeenItem[], y: number): number {
+  let bestIdx = -1;
+  let bestDist = Infinity;
+  for (let i = 0; i < snapshot.length; i++) {
+    const s = snapshot[i]!;
+    const sy = typeof s.y === 'number' ? (s.y as number) : NaN;
+    if (!Number.isFinite(sy)) continue;
+    const d = Math.abs(sy - y);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  }
+  return bestIdx;
 }

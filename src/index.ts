@@ -12,19 +12,10 @@ type DbOp = {
   bank_category: string;
   amount: number;
   bank: string;
-  message?: string | null;
-  op_time?: Date | null;
   op_datetime_text?: string | null;
-  account_name?: string | null;
-  account_mask?: string | null;
-  counterparty?: string | null;
-  counterparty_phone?: string | null;
-  counterparty_bank?: string | null;
-  fee_amount?: number | null;
-  total_amount?: number | null;
-  channel?: string | null;
   op_datetime?: Date | null;
   details?: Record<string, string> | null;
+  rrn?: string | null;
   id_hash?: string | null;
 };
 
@@ -48,6 +39,17 @@ async function getLatestKnown(POOL: PgPool, bank: string): Promise<{ raw_date: s
   const r = await POOL.query(sql, [bank]);
   if (r.rows.length === 0) return null;
   return r.rows[0];
+}
+
+async function getRecentRrns(POOL: PgPool, bank: string, limit: number = 10): Promise<Set<string>> {
+  const sql = 'select rrn from finance.operations where bank = $1 and rrn is not null order by id desc limit $2';
+  const r = await POOL.query(sql, [bank, limit]);
+  const s = new Set<string>();
+  for (const row of r.rows) {
+    const v = String(row.rrn || '').trim();
+    if (v) s.add(v);
+  }
+  return s;
 }
 
 function normalizeDate(raw: string): string {
@@ -74,7 +76,7 @@ function normalizeDate(raw: string): string {
 
 async function insertNew(POOL: PgPool, ops: DbOp[]): Promise<number> {
   if (ops.length === 0) return 0;
-  const cols = ['raw_date','op_date','text','bank_category','amount','bank','message','op_time','op_datetime_text','account_name','account_mask','counterparty','counterparty_phone','counterparty_bank','fee_amount','total_amount','channel','op_datetime','details','id_hash'];
+  const cols = ['raw_date','op_date','text','bank_category','amount','bank','op_datetime_text','op_datetime','details','rrn','id_hash'];
   const valuesSql = ops.map((_, i) => '(' + cols.map((__, j) => `$${i*cols.length + j + 1}`).join(', ') + ')').join(', ');
   const sql = `insert into finance.operations (${cols.join(', ')}) values ${valuesSql}
     on conflict do nothing`;
@@ -87,19 +89,10 @@ async function insertNew(POOL: PgPool, ops: DbOp[]): Promise<number> {
       o.bank_category,
       o.amount,
       o.bank,
-      o.message ?? null,
-      o.op_time ?? null,
       o.op_datetime_text ?? null,
-      o.account_name ?? null,
-      o.account_mask ?? null,
-      o.counterparty ?? null,
-      o.counterparty_phone ?? null,
-      o.counterparty_bank ?? null,
-      o.fee_amount ?? null,
-      o.total_amount ?? null,
-      o.channel ?? null,
       o.op_datetime ?? null,
       o.details ? JSON.stringify(o.details) : null,
+      o.rrn ?? null,
       o.id_hash ?? null,
     );
   }
@@ -131,14 +124,21 @@ async function main(): Promise<void> {
     await collector.loginAndPrepare();
 
     let latest = await getLatestKnown(pool, 'vtb');
+    const recentRrns = await getRecentRrns(pool, 'vtb', 10);
     let collected: BankOperationItem[] = [];
     const sentinel = '__STOP_ON_OLD__';
     const onSnapshot = async (items: BankOperationItem[]) => {
       console.log(`[vtb] onSnapshot ${items.length} operations`);
       collected.push(...items);
-      if (latest) {
-        const foundByLegacy = items.some(it => it.date === latest!.raw_date && it.text === latest!.text && it.amount === Number(latest!.amount) && (it.opDateTimeText || '') === (latest!.op_datetime_text || ''));
-        if (foundByLegacy) throw new Error(sentinel);
+      if (recentRrns.size > 0) {
+        const hasRecentRrn = items.some(it => {
+          const d = it.details || {};
+          const key = Object.keys(d).find(k => k.toLowerCase() === 'rrn');
+          const v = key ? (d as Record<string, string>)[key] : undefined;
+          const s = (v || '').trim();
+          return !!s && recentRrns.has(s);
+        });
+        if (hasRecentRrn) throw new Error(sentinel);
       }
     };
     try {
@@ -158,7 +158,16 @@ async function main(): Promise<void> {
 
     const newOnly: DbOp[] = [];
     for (const it of newestFirst) {
-      const isOld = latest && (it.date === latest.raw_date && it.text === latest.text && it.amount === Number(latest.amount) && (it.opDateTimeText || '') === (latest.op_datetime_text || ''));
+      const rrnIt = (() => {
+        const d = it.details || {};
+        const key = Object.keys(d).find(k => k.toLowerCase() === 'rrn');
+        const v = key ? (d as Record<string, string>)[key] : undefined;
+        const s = (v || '').trim();
+        return s || '';
+      })();
+      const isOldByRrn = rrnIt ? recentRrns.has(rrnIt) : false;
+      const isOldByLegacy = latest && (it.date === latest.raw_date && it.text === latest.text && it.amount === Number(latest.amount) && (it.opDateTimeText || '') === (latest.op_datetime_text || ''));
+      const isOld = isOldByRrn || !!isOldByLegacy;
       if (isOld) break;
       // compute deterministic id_hash from a stable set of fields
       const detailPairs = Object.entries(it.details || {}).filter(([k, v]) => !!k && !!v);
@@ -167,11 +176,16 @@ async function main(): Promise<void> {
         text: it.text,
         amount: it.amount,
         opDateTimeText: it.opDateTimeText || '',
-        accountMask: it.accountMask || '',
-        counterparty: it.counterparty || '',
         details: detailPairs,
       });
       const idHash = crypto.createHash('sha256').update(identitySource).digest('hex').slice(0, 24);
+      const rrn = (() => {
+        const d = it.details || {};
+        const key = Object.keys(d).find(k => k.toLowerCase() === 'rrn');
+        const v = key ? (d as Record<string, string>)[key] : undefined;
+        const s = (v || '').trim();
+        return s ? s : null;
+      })();
 
       newOnly.push({
         raw_date: it.date,
@@ -180,19 +194,10 @@ async function main(): Promise<void> {
         bank_category: it.category,
         amount: it.amount,
         bank: 'vtb',
-        message: it.message || null,
-        op_time: parseRuDateTime(it.opDateTimeText || '') || null,
         op_datetime_text: it.opDateTimeText || null,
-        account_name: it.accountName || null,
-        account_mask: it.accountMask || null,
-        counterparty: it.counterparty || null,
-        counterparty_phone: it.counterpartyPhone || null,
-        counterparty_bank: it.counterpartyBank || null,
-        fee_amount: typeof it.feeAmount === 'number' ? it.feeAmount : null,
-        total_amount: typeof it.totalAmount === 'number' ? it.totalAmount : null,
-        channel: it.channel || null,
         op_datetime: parseRuDateTime(it.opDateTimeText || '') || null,
         details: it.details || null,
+        rrn,
         id_hash: idHash,
       });
     }
