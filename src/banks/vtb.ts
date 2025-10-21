@@ -121,7 +121,7 @@ async function collectOperationsVtb(page: any, maxPages: number, onSnapshot?: (i
     let nextIndexToCollect = -1;
     let lastSnapshot: GeneralSeenItem[] = [];
     for (let k = 0; k < 3; k++) {
-      await humanPause(page, 1000, 1500);
+      await humanPause(page, 1500, 2000);
       lastSnapshot = await getGeneralSeenSnapshot(page);
       generalSeen.push(...extendGeneralSeen(generalSeen, lastSnapshot));
       nextIndexToCollect = getNextIndexToCollect(generalSeen, lastSnapshot);
@@ -310,7 +310,7 @@ async function clickAndParseItem(page: any, loc: any, returnScrollY?: number): P
   // click on item
   try {
     console.log('-------------------------------------------')
-    await humanPause(page, 1200, 2000);
+    await humanPause(page, 100, 200);
     if (typeof returnScrollY === 'number' && Number.isFinite(returnScrollY)) {
       try {
         await page.evaluate((y: number) => { window.scrollTo(0, Math.max(0, y - 80)); }, returnScrollY);
@@ -318,7 +318,7 @@ async function clickAndParseItem(page: any, loc: any, returnScrollY?: number): P
     }
     try { console.log('[vtb] clickAndParseItem:scrolled'); } catch {}
 
-    await humanPause(page, 200, 800);
+    await humanPause(page, 200, 400);
     
     await loc.click();
     try { console.log('[vtb] clickAndParseItem:clicked'); } catch {}
@@ -451,7 +451,7 @@ async function clickAndParseItem(page: any, loc: any, returnScrollY?: number): P
     return null;
   } finally {
     try { console.log('[vtb] clickAndParseItem:go_back'); } catch {}
-    await humanPause(page, 1500, 2000);
+    await humanPause(page, 100, 300);
 
     try { await page.evaluate(() => history.back()); } catch (e) { try { console.log('[vtb] clickAndParseItem:error_history_back', { e }); } catch {} }
 
@@ -492,7 +492,8 @@ function extendGeneralSeen(generalSeenArray: GeneralSeenItem[], lastSnapshot: Ge
 
   for (let i = 0; i < lastSnapshot.length; i++) {
     const text = lastSnapshot[i]!.text;
-    const uncheckedIndex = tempGeneralSeen.findIndex(item => item.text === text && !item.checked);
+    const y = lastSnapshot[i]!.y;
+    const uncheckedIndex = tempGeneralSeen.findIndex(item => item.text === text && Math.abs(item!.y! - y!) < 10 && !item.checked);
     if (uncheckedIndex >= 0) {
       tempGeneralSeen[uncheckedIndex]!.checked = true;
       const existedTextIndex = newItemsTexts.indexOf(text);
@@ -526,7 +527,7 @@ function getNextIndexToCollect(generalSeen: GeneralSeenItem[], lastSnapshot: Gen
       console.log('~ ~')
       console.log(lastSnapshot.map(s => ({ text: s.text.slice(0, 15), y: s.y })))
       console.log('~ ~')
-      console.log('[vtb] getNextIndexToCollect', { i, text: gs.text });
+      console.log('[vtb] getNextIndexToCollect', { i, text: gs.text, y: gs.y });
       return i;
     }
   }

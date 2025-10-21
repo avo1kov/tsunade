@@ -115,6 +115,20 @@ function parseRuDateTime(text: string): Date | null {
   return new Date(year, mi, day, hh, mm);
 }
 
+function extractRrnFromDetails(details?: Record<string, string> | null): string {
+  const d = details || {};
+  const keys = Object.keys(d);
+  // Prefer explicit RRN key
+  const rrnKey = keys.find(k => (k || '').trim().toLowerCase() === 'rrn');
+  const rrnVal = rrnKey ? (d as Record<string, string>)[rrnKey] : undefined;
+  const rrn = (rrnVal || '').trim();
+  if (rrn) return rrn;
+  // Fallback to 'Идентификатор операции СБП' label
+  const fbKey = keys.find(k => (k || '').trim().toLowerCase().includes('идентификатор операции сбп'));
+  const fbVal = fbKey ? (d as Record<string, string>)[fbKey] : undefined;
+  return (fbVal || '').trim();
+}
+
 async function main(): Promise<void> {
   const pool = await makePool();
   // await sendText('Скоро будет SMS код');
@@ -132,10 +146,7 @@ async function main(): Promise<void> {
       collected.push(...items);
       if (recentRrns.size > 0) {
         const hasRecentRrn = items.some(it => {
-          const d = it.details || {};
-          const key = Object.keys(d).find(k => k.toLowerCase() === 'rrn');
-          const v = key ? (d as Record<string, string>)[key] : undefined;
-          const s = (v || '').trim();
+          const s = extractRrnFromDetails(it.details || null);
           return !!s && recentRrns.has(s);
         });
         if (hasRecentRrn) throw new Error(sentinel);
@@ -158,13 +169,7 @@ async function main(): Promise<void> {
 
     const newOnly: DbOp[] = [];
     for (const it of newestFirst) {
-      const rrnIt = (() => {
-        const d = it.details || {};
-        const key = Object.keys(d).find(k => k.toLowerCase() === 'rrn');
-        const v = key ? (d as Record<string, string>)[key] : undefined;
-        const s = (v || '').trim();
-        return s || '';
-      })();
+      const rrnIt = extractRrnFromDetails(it.details || null);
       const isOldByRrn = rrnIt ? recentRrns.has(rrnIt) : false;
       const isOldByLegacy = latest && (it.date === latest.raw_date && it.text === latest.text && it.amount === Number(latest.amount) && (it.opDateTimeText || '') === (latest.op_datetime_text || ''));
       const isOld = isOldByRrn || !!isOldByLegacy;
@@ -179,13 +184,8 @@ async function main(): Promise<void> {
         details: detailPairs,
       });
       const idHash = crypto.createHash('sha256').update(identitySource).digest('hex').slice(0, 24);
-      const rrn = (() => {
-        const d = it.details || {};
-        const key = Object.keys(d).find(k => k.toLowerCase() === 'rrn');
-        const v = key ? (d as Record<string, string>)[key] : undefined;
-        const s = (v || '').trim();
-        return s ? s : null;
-      })();
+      const rrnCandidate = extractRrnFromDetails(it.details || null);
+      const rrn = rrnCandidate ? rrnCandidate : null;
 
       newOnly.push({
         raw_date: it.date,
